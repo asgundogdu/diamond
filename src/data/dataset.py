@@ -11,7 +11,10 @@ from .episode import Episode
 from .segment import Segment, SegmentId
 from .utils import make_segment
 from utils import StateDictMixin
-
+# Set up logging
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class Dataset(StateDictMixin, torch.utils.data.Dataset):
     def __init__(
@@ -40,6 +43,12 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         self._default_path = self._directory / "info.pt"
         self._cache = mp.Manager().dict() if use_manager else {}
         self._reset()
+
+        logger.info(f"Initialized Dataset: {self._name}")
+        logger.info(f"Data directory: {self._directory}")
+        logger.info(f"Cache in RAM: {self._cache_in_ram}")
+        logger.info(f"Save on disk: {self._save_on_disk}")
+
 
     def __len__(self) -> int:
         return self.num_steps
@@ -81,10 +90,13 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
     def load_episode(self, episode_id: int) -> Episode:
         if self._cache_in_ram and episode_id in self._cache:
             episode = self._cache[episode_id]
+            logger.debug(f"Loaded episode {episode_id} from RAM cache")
         else:
             episode = Episode.load(self._get_episode_path(episode_id))
+            logger.debug(f"Loaded episode {episode_id} from disk")
             if self._cache_in_ram:
                 self._cache[episode_id] = episode
+                logger.debug(f"Cached episode {episode_id} in RAM")
         return episode
 
     def add_episode(self, episode: Episode, *, episode_id: Optional[int] = None) -> int:
@@ -97,7 +109,7 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
             self.lengths = np.concatenate((self.lengths, np.array([len(episode)])))
             self.num_steps += len(episode)
             self.num_episodes += 1
-
+            logger.debug(f"Added episode {episode_id} with {len(episode)} steps")
         else:
             assert episode_id < self.num_episodes
             old_episode = self.load_episode(episode_id)
@@ -107,16 +119,17 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
             self.num_steps += incr_num_steps
             self.counter_rew.subtract(old_episode.rew.sign().tolist())
             self.counter_end.subtract(old_episode.end.tolist())
+            logger.info(f"Updated episode {episode_id} with {incr_num_steps} steps")
 
         self.counter_rew.update(episode.rew.sign().tolist())
         self.counter_end.update(episode.end.tolist())
 
         if self._save_on_disk:
             episode.save(self._get_episode_path(episode_id))
-
+            logger.debug(f"Saved episode {episode_id} to disk")
         if self._cache_in_ram:
             self._cache[episode_id] = episode
-
+            logger.debug(f"Cached episode {episode_id} in RAM")
         return episode_id
 
     def _get_episode_path(self, episode_id: int) -> Path:
@@ -125,6 +138,8 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
         subfolders = np.floor((episode_id % 10 ** (1 + powers)) / 10**powers) * 10**powers
         subfolders = [int(x) for x in subfolders[::-1]]
         subfolders = "/".join([f"{x:0{n - i}d}" for i, x in enumerate(subfolders)])
+        full_path = (self._directory / subfolders / f"{episode_id}.pt").absolute()
+        logger.debug(f"Full episode path: {full_path}")
         return self._directory / subfolders / f"{episode_id}.pt"
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
@@ -137,7 +152,10 @@ class Dataset(StateDictMixin, torch.utils.data.Dataset):
     def save_to_default_path(self) -> None:
         self._default_path.parent.mkdir(exist_ok=True, parents=True)
         torch.save(self.state_dict(), self._default_path)
-
+        logger.info(f"Saved dataset state to {self._default_path}")
     def load_from_default_path(self) -> None:
         if self._default_path.is_file():
             self.load_state_dict(torch.load(self._default_path))
+            logger.info(f"Loaded dataset state from {self._default_path}")
+        else:
+            logger.info(f"No dataset state found at {self._default_path}")

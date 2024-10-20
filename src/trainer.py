@@ -12,6 +12,10 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
 import wandb
+import logging
+
+logger = logging.getLogger(__name__)
+import os
 
 from agent import Agent
 from coroutines.collector import make_collector, NumToCollect
@@ -36,6 +40,13 @@ from utils import (
 )
 
 
+# Check if WANDB_API_KEY is set
+if 'WANDB_API_KEY' not in os.environ:
+    logger.warning("WANDB_API_KEY is not set in the environment variables. Logs may not be sent to wandb.")
+else:
+    logger.info("WANDB_API_KEY is set. Logs will be sent to wandb.")
+
+
 class Trainer(StateDictMixin):
     def __init__(self, cfg: DictConfig, root_dir: Path) -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -56,9 +67,46 @@ class Trainer(StateDictMixin):
 
         # Init wandb
         if self._rank == 0:
-            try_until_no_except(
-                partial(wandb.init, config=OmegaConf.to_container(cfg, resolve=True), reinit=True, resume=True, **cfg.wandb)
-            )
+            logger.info(f"Wandb config from cfg.wandb: {cfg.wandb}")
+            
+            if cfg.wandb.get('mode') == 'disabled':
+                logger.info("Wandb is disabled in the configuration. No logs will be sent to wandb.")
+                wandb.init(mode="disabled")
+            else:
+                try:
+                    # Ensure WANDB_API_KEY is set in the environment
+                    if 'WANDB_API_KEY' not in os.environ:
+                        logger.warning("WANDB_API_KEY is not set in the environment variables. Logs may not be sent to wandb.")
+                    else:
+                        logger.info(f"WANDB_API_KEY is set. Value: {os.environ['WANDB_API_KEY'][:5]}...")
+
+                    logger.info("Initializing wandb...")
+                    wandb_config = OmegaConf.to_container(cfg, resolve=True)
+                    
+                    wandb.init(
+                        config=wandb_config,
+                        reinit=True,
+                        resume=True, 
+                        **cfg.wandb
+                    )
+                    
+                    if wandb.run is not None:
+                        logger.info(f"Wandb run initialized. Run ID: {wandb.run.id}")
+                        logger.info(f"Wandb run name: {wandb.run.name}")
+                        logger.info(f"Wandb project: {wandb.run.project}")
+                        logger.info(f"Wandb entity: {wandb.run.entity}")
+                        if wandb.run.url:
+                            logger.info(f"View logs at: {wandb.run.url}")
+                            print(f"\nWandb run initialized. View logs at: {wandb.run.url}\n")
+                        else:
+                            logger.warning("Wandb run URL is not available.")
+                    else:
+                        logger.warning("Wandb run is None after initialization.")
+                except Exception as e:
+                    logger.error(f"Failed to initialize wandb: {str(e)}", exc_info=True)
+                    print("Wandb initialization failed. Logs will not be available.")
+                    wandb.init(mode="disabled")
+                    raise e
 
         # Flags
         self._is_static_dataset = cfg.static_dataset.path is not None
@@ -83,7 +131,11 @@ class Trainer(StateDictMixin):
             path_config = Path("config") / "trainer.yaml"
             path_config.parent.mkdir(exist_ok=False, parents=False)
             shutil.move(".hydra/config.yaml", path_config)
-            wandb.save(str(path_config))
+             # Move this line after wandb.init()
+            if wandb.run is not None:
+                wandb.save(str(path_config))
+            else:
+                logger.warning("wandb.run is None. Config file not saved to wandb.")
             shutil.copytree(src=root_dir / "src", dst="./src")
             shutil.copytree(src=root_dir / "scripts", dst="./scripts")
 
@@ -95,6 +147,9 @@ class Trainer(StateDictMixin):
         self.test_dataset = Dataset(p / "test", "test_dataset", cache_in_ram=True)
         self.train_dataset.load_from_default_path()
         self.test_dataset.load_from_default_path()
+
+        logger.info(f"Train dataset path: {self.train_dataset._directory}")
+        logger.info(f"Test dataset path: {self.test_dataset._directory}")
 
         # Envs
         if self._rank == 0:
@@ -206,20 +261,33 @@ class Trainer(StateDictMixin):
             print(self.train_dataset)
             print(self.test_dataset)
 
+        logger.info("Trainer initialized")
+        logger.info(f"Device: {self._device}")
+        logger.info(f"World size: {self._world_size}")
+        logger.info(f"Rank: {self._rank}")
+
     def run(self) -> None:
         to_log = []
+
+        logger.info("Starting training run")
 
         if self.epoch == 0:
             if self._is_model_free or self._is_static_dataset:
                 self.num_epochs_collect = 0
+                logger.info("Model-free or static dataset: skipping initial data collection")
             else:
                 if self._rank == 0:
+                    logger.info("Collecting initial dataset")
                     self.num_epochs_collect, to_log_ = self.collect_initial_dataset()
                     to_log += to_log_
                 self.num_epochs_collect, sd_train_dataset = broadcast_if_needed(self.num_epochs_collect, self.train_dataset.state_dict())
                 self.train_dataset.load_state_dict(sd_train_dataset)
+                logger.info(f"Initial dataset collection complete. Num epochs collect: {self.num_epochs_collect}")
 
         num_epochs = self.num_epochs_collect + self._cfg.training.num_final_epochs
+        # Maybe hardcode num_epochs 
+        num_epochs = 2
+        logger.info(f"Total number of epochs: {num_epochs}")
 
         while self.epoch < num_epochs:
             self.epoch += 1
@@ -228,16 +296,20 @@ class Trainer(StateDictMixin):
             if self._rank == 0:
                 print(f"\nEpoch {self.epoch} / {num_epochs}\n")
 
+            logger.info(f"Starting epoch {self.epoch} / {num_epochs}")
+
             # Training
             should_collect_train = (self._rank == 0 and not self._is_model_free and not self._is_static_dataset and self.epoch <= self.num_epochs_collect)
 
             if should_collect_train:
+                logger.info("Collecting training data")
                 c = self._cfg.collection.train
                 to_log += self._train_collector.send(NumToCollect(steps=c.steps_per_epoch))
             sd_train_dataset, = broadcast_if_needed(self.train_dataset.state_dict())  # update dataset for ranks > 0
             self.train_dataset.load_state_dict(sd_train_dataset)
             
             if self._cfg.training.should:
+                logger.info("Starting agent training")
                 to_log += self.train_agent()
 
             # Evaluation
@@ -245,18 +317,22 @@ class Trainer(StateDictMixin):
             should_collect_test = should_test and not self._is_static_dataset
 
             if should_collect_test:
+                logger.info("Collecting test data")
                 to_log += self.collect_test()
 
             if should_test and not self._is_model_free:
+                logger.info("Starting agent testing")
                 to_log += self.test_agent()
 
             # Logging
             to_log.append({"duration": (time.time() - start_time) / 3600})
             if self._rank == 0:
                 wandb_log(to_log, self.epoch)
+                print(f"\nEpoch {self.epoch} logs uploaded. View at: {wandb.run.url}\n")
             to_log = []
 
             # Checkpointing
+            logger.info(f"Saving checkpoint for epoch {self.epoch}")
             self.save_checkpoint()
             
             if dist.is_initialized():
@@ -265,9 +341,14 @@ class Trainer(StateDictMixin):
         # Last collect
         if self._rank == 0 and not self._is_static_dataset:
             wandb_log(self.collect_test(final=True), self.epoch)
+            print(f"\nFinal test logs uploaded. View at: {wandb.run.url}\n")
+
+        # Final sync
+        if self._rank == 0 and wandb.run is not None:
+            wandb.finish()
 
     def collect_initial_dataset(self) -> Tuple[int, Logs]:
-        print("\nInitial collect\n")
+        logger.info("Starting initial dataset collection")
         to_log = []
         c = self._cfg.collection.train
         min_steps = c.first_epoch.min
@@ -300,6 +381,7 @@ class Trainer(StateDictMixin):
         return num_epochs_collect, to_log
 
     def collect_test(self, final: bool = False) -> Logs:
+        logger.info(f"Starting {'final' if final else 'test'} data collection")
         c = self._cfg.collection.test
         episodes = c.num_final_episodes if final else c.num_episodes
         td = self.test_dataset
@@ -324,10 +406,12 @@ class Trainer(StateDictMixin):
         return to_log
 
     def train_agent(self) -> Logs:
+        logger.info("Starting agent training")
         self.agent.train()
         self.agent.zero_grad()
         to_log = []
         model_names = ["actor_critic"] if self._is_model_free else self._model_names
+        logger.info(f"All onents: {model_names}")
         for name in model_names:
             cfg = getattr(self._cfg, name).training
             if self.epoch > cfg.start_after_epochs:
@@ -337,6 +421,7 @@ class Trainer(StateDictMixin):
 
     @torch.no_grad()
     def test_agent(self) -> Logs:
+        logger.info("Starting agent testing")
         self.agent.eval()
         to_log = []
         model_names = [] if self._is_model_free else self._model_names[:-1]
@@ -347,6 +432,7 @@ class Trainer(StateDictMixin):
         return to_log
 
     def train_component(self, name: str, steps: int) -> Logs:
+        logger.info(f"Training component: {name}")
         cfg = getattr(self._cfg, name).training
         model = getattr(self._agent, name)
         opt = self.opt.get(name)
@@ -359,7 +445,9 @@ class Trainer(StateDictMixin):
         to_log = []
 
         num_steps = cfg.grad_acc_steps * steps
-
+        logger.info(f"total number of steps: {num_steps} - grad_acc_steps: {cfg.grad_acc_steps} - steps: {steps}")
+        num_steps = 1000
+        logger.info(f"Hardcoded total number of steps: {num_steps}")
         for i in trange(num_steps, desc=f"Training {name}", disable=self._rank > 0):
             batch = next(data_iterator).to(self._device) if data_iterator is not None else None
             loss, metrics = model(batch) if batch is not None else model()

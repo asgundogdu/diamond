@@ -8,10 +8,10 @@ hydra:
     chdir: True
 
 wandb:
-  mode: disabled
-  project: null
-  entity: null
-  name: null
+  mode: online
+  project: "atari-world-models"
+  entity: "gundogdu-latent-games"
+  name: ${hydra:job.name}
   group: null
   tags: null
   notes: null
@@ -37,8 +37,8 @@ collection:
     epsilon: 0.01
     num_steps_total: 100000
     first_epoch:
-      min: 5000
-      max: 10000  # null: no maximum
+      min: 500 # originally 5000
+      max: 1000  # null: no maximum - training step for denouser? originally 10000
       threshold_rew: 10
     steps_per_epoch: 100
   test:
