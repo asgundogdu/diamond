@@ -18,6 +18,7 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 import wandb
+import os
 
 
 ATARI_100K_GAMES = [
@@ -201,7 +202,8 @@ def get_path_agent_ckpt(path_ckpt_dir: Union[str, Path], epoch: int, num_zeros: 
     if epoch >= 0:
         return d / f"agent_epoch_{epoch:0{num_zeros}d}.pt"
     else:
-        all_ = sorted(list(d.iterdir()))
+        all_ = sorted(list(d.glob('*')))
+        print(f"all_: {all_}")
         assert len(all_) >= -epoch
         return all_[epoch]
 
@@ -216,18 +218,22 @@ def keep_agent_copies_every(
     assert every > 0
     assert num_to_keep is None or num_to_keep > 0
     get_path = partial(get_path_agent_ckpt, path_ckpt_dir)
-    get_path(0).parent.mkdir(parents=False, exist_ok=True)
+    os.makedirs(get_path(0).parent, exist_ok=True)
 
     # Save agent
     save_with_backup(agent_sd, get_path(epoch))
 
     # Clean oldest
     if (num_to_keep is not None) and (epoch % every == 0):
-        get_path(max(0, epoch - num_to_keep * every)).unlink(missing_ok=True)
+        oldest_path = get_path(max(0, epoch - num_to_keep * every))
+        if os.path.exists(oldest_path):
+            os.remove(oldest_path)
 
     # Clean previous
     if (epoch - 1) % every != 0:
-        get_path(max(0, epoch - 1)).unlink(missing_ok=True)
+        prev_path = get_path(max(0, epoch - 1))
+        if os.path.exists(prev_path):
+            os.remove(prev_path)
 
 
 def process_confusion_matrices_if_any_and_compute_classification_metrics(logs: Logs) -> None:
@@ -277,16 +283,17 @@ def prompt_run_name(game):
 
 
 def save_info_for_import_script(epoch: int, run_name: str, path_ckpt_dir: Path) -> None:
-    with (path_ckpt_dir / "info_for_import_script.json").open("w") as f:
+    with open(os.path.join(path_ckpt_dir, "info_for_import_script.json"), "w") as f:
         json.dump({"epoch": epoch, "name": run_name}, f)
 
 
 def save_with_backup(obj: Any, path: Path):
     bk = path.with_suffix(".bk")
-    if path.is_file():
-        path.rename(bk)
+    if os.path.isfile(path):
+        os.rename(path, bk)
     torch.save(obj, path)
-    bk.unlink(missing_ok=True)
+    if os.path.exists(bk):
+        os.remove(bk)
 
 
 def set_seed(seed: int) -> None:
@@ -299,7 +306,7 @@ def set_seed(seed: int) -> None:
 def skip_if_run_is_over(func: Callable) -> Callable:
     def inner(*args, **kwargs):
         path_run_is_over = Path(".run_is_over")
-        if not path_run_is_over.is_file():
+        if not os.path.isfile(path_run_is_over):
             func(*args, **kwargs)
             path_run_is_over.touch()
         else:
